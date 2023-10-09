@@ -1,0 +1,352 @@
+########################################################################
+###################Bonaire spatial data wrangling#######################
+########################################################################
+
+# Necessary packages;
+library(ENMeval)
+library(magrittr)
+library(raster)
+library(rgdal)
+library(spatialEco)
+library(dplyr)
+library(sf)
+library(raster)
+library(sp)
+
+########################################################################
+##########################Prerequisites################################# 
+########################################################################
+
+# Manually set temp folder to be able to easily remove files (some of the steps below generate a lot of temp data);
+options(rasterTmpDir = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS")
+
+# Upload landuse layer, also to use as basis (raster extent, coordinate system) to prepare all other layers. The original land use layer (from https://www.dcbd.nl/) had a resolution of 2x2m, equaling 16875 columns, 13285 rows; 224184375 cells. This made data processing cumbersome. I therefore resampled the layer to 10x10m. Disaggregating in R took too much memory, so I resampled the layer in ArcGIS (Data Management Tools > Raster Processing > Resample).  
+landuse <- raster("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/LCCbonaire37/lccbonaire_v37_10x10m.tif")
+landuse # check
+
+# Grab coordinate system as separate object;
+crs <- crs(landuse)
+
+# Upload shape file of Bonaire to crop raster layers. I'm using the soil layer from dcbd.nl here, because it includes a highly accurate coast line;
+bonaire.shape <- readOGR(dsn = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/bonbod.shp")
+# Get rid of internal subdivisions;
+bonaire.shape <- aggregate(bonaire.shape)
+# Transform to same coordinate system as the land use layer;
+bonaire.shape <- spTransform(bonaire.shape, crs)
+plot(bonaire.shape) # check
+
+# Generate empty 'base raster' for Bonaire, which we'll use as a basis to create other variables. 
+bonaire.raster <- landuse
+values(bonaire.raster) <- 0
+plot(bonaire.raster)
+
+########################################################################
+###############Preparing (trial) species data for SDMs##################
+########################################################################
+
+# Upload mosquito coordinates from own file;
+MosquitoBon <- na.exclude(read.delim("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/Species/CulicidaeBonaire.txt", h = T, sep = "\t", row.names = NULL, dec = ","))
+
+### Create species occurence plots ###
+Pconf <- subset(MosquitoBon, Species == "Psorophora confinis")
+
+# Transform to a SpatialPointsDataFrame in order to change the coordinate system (GBIF data always comes in WGS84 (degrees), but the land use layer is in a local UTM system (meters). Using meters is more nice; makes SDM results easier to interpret;
+# First, grab coordinates;
+coords <- Pconf[, c("Long", "Lat")]
+# Grab data (in this case just species name);
+data <- as.data.frame(Pconf[, c("Species")]) # data
+# Define coordinate system;
+crs_WGS <- CRS("+init=epsg:4326") # WGS84 proj4string
+# Create SPDF;
+Pconf_spdf <- SpatialPointsDataFrame(coords = coords,
+                                           data = data, 
+                                           proj4string = crs_WGS)
+
+# Transform to the Bonaire coordinate system;
+Pconf_spdf <- spTransform(Pconf_spdf, crs)
+
+# Plot map and coordinates to check;
+plot(bonaire.shape)
+plot(Pconf_spdf, pch=20, col="brown", add = TRUE)
+
+## END ##
+
+# Transform to a SpatialPointsDataFrame in order to change the coordinate system (GBIF data always comes in WGS84 (degrees), but the land use layer is in a local UTM system (meters). Using meters is more nice; makes SDM results easier to interpret;
+# First, grab coordinates;
+coords <- MosquitoBon[, c("Long", "Lat")]
+# Grab data (in this case just species name);
+data <- as.data.frame(MosquitoBon[, c("Species")]) # data
+# Define coordinate system;
+crs_WGS <- CRS("+init=epsg:4326") # WGS84 proj4string
+# Create SPDF;
+MosquitoBon_spdf <- SpatialPointsDataFrame(coords = coords,
+                                        data = data, 
+                                        proj4string = crs_WGS)
+
+# Transform to the Bonaire coordinate system;
+MosquitoBon_spdf <- spTransform(MosquitoBon_spdf, crs)
+
+# Plot map and coordinates to check;
+plot(landuse)
+plot(MosquitoBon_spdf, add = TRUE)
+
+# Some coordinates fall beyond terrestrial borders, get rid of those;
+MosquitoBon_spdf <- MosquitoBon_spdf[!is.na(over(MosquitoBon_spdf, bonaire.shape)),]
+# Rename species column (was attributed a weird name);
+names(MosquitoBon_spdf@data)[names(MosquitoBon_spdf@data) == 'MosquitoBon[, c("Species")]'] <- 'Species'
+# Write .txt to working directory if desired;
+write.table(MosquitoBon_spdf, file = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/MosquitoBon_cleaned.txt", sep = "\t", col.names = TRUE)
+
+# Write to shapefile (for QGIS, ArcGIS) if desired;
+shapefile(MosquitoBon_spdf, "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/Species/MosquitoBon.shp", overwrite = TRUE)
+
+
+########################################################################
+##################Preparing background data for SDMs####################
+########################################################################
+
+# To create predictions and evaluate species-predictor relationships, SDMs need 'background records' (also sometimes erronously called 'pseudoabsences') to compare to species presence records. Traditionally, these records are randomly drawn from the study area. There is however always a risk that the study area includes environments that haven't been sampled, for instance because they are inhospitable. Nevertheless, the species may still be present there. If, by random background sampling, those areas are included as background sites, the model will assume that those environmental conditions are unsuitable for the species - which may not be the case. A better way to draw background records is therefore to take sampling effort into account; only use well-sampled cells of a given grid to draw background coordinates from.
+
+# First, upload 1x1km shape file grid ("kilometerhokken") for Bonaire. I created this in ArcGIS (Data Management > Sampling > Create fishnet) using the 10x10m land use layer as basis, because there doesn't seem to be a standard grid available for the island.
+bonaire.grid <- readOGR(dsn = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/grid.shp")
+
+# The grid has a field named 'Cellcode'. Join grid and species data (generated above) so we know in which grid cell the occurrences are located;
+species.grid <- point.in.poly(MosquitoBon_spdf, bonaire.grid)
+# Transform back to data frame;
+species.grid <- na.omit(data.frame(species.grid))
+# Rename species column (was attributed a weird name at some point);
+names(species.grid)[names(species.grid) == 'MosquitoBon[, c("Species")]'] <- 'Species'
+# Get rid of duplicate records (same species in same eea Cellcode);
+species.grid <- species.grid %>% distinct(Species, Cellcode, .keep_all = TRUE)
+
+# Count species per cell to determine sampling effort. First, summarize observations per 1x1km grid;
+bg.grid.count <- species.grid %>%
+  group_by(Cellcode) %>%
+  dplyr::summarise(n.sp = length(unique(species)))
+# Then, decide for yourself what a well-sampled grid cell would be. This will always be an arbitrary step, which will depend on the amount of species in the data set, and the region in which records were collected. Our trial ruthveni data comprises just one species. For the mosquitos, perhaps you'd set a threshold at three species, or four - depends on the field data;
+ws.grids <- bg.grid.count %>%
+  filter(n.sp > 2) # select all grid cells with more than 0 species (silly, but let's make it work with the ruthveni data)
+
+# Convert to vector of grid cells;
+vec.grid <- levels(factor(ws.grids$Cellcode))
+# Subset grid with vector;
+grid.bg <- bonaire.grid[bonaire.grid$Cellcode %in% vec.grid,]
+plot(grid.bg) # check; those are your well-sampled grid cells.
+grid.bg.sf <- st_as_sf(grid.bg) # convert to sf for further processing.
+i = nrow(grid.bg@data) # nr. of rows in data frame
+bg <- st_sample(grid.bg.sf, i) # sample background sites from cells
+# Convert into a data frame with X and Y columns. Make sure these have the same name as your species X and Y columns!
+bg <- do.call(rbind, st_geometry(bg)) %>% 
+  as_tibble() %>% setNames(c("Long","Lat"))
+write.table(bg, file = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/bgm.txt", sep = "\t", col.names = TRUE) # write
+
+
+########################################################################
+#####################Preparing spatial predictors#######################
+########################################################################
+
+# We manually reclassified the land use layer several times to create a series of dedicated layers (urban area, urban green). Reclassifications were done in ArcGIS (Spatial Analyst Tools > Reclass > Reclassify). We did this for two reasons; SDM's might have a hard time working with categorical layers (e.g. the land use layer) that contain many classes, and we want to use the dedicated layers to create distance-to variables.
+
+# Copy the cropped landuse layer as a separate layer for later stacking. Cropping rasters in R always results in a rectangle. Therefore, I subsequently mask the layer to the Bonaire coastline. We'll also use this one to mask all the other layers;
+landuse_sdm <- mask(landuse, bonaire.shape)
+names(landuse_sdm) <- "landuse_sdm" # rename layer
+
+# The other spatial predictors are in various formats, have different coordinate systems, etc. So, upload and process one by one.
+
+#############################Riverbeds##################################
+
+# Riverbeds (https://www.dcbd.nl/document/riverbeds-map-bonaire);
+riverbeds <- readOGR(dsn = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/flowacc_waterflows.shp")
+riverbeds$grid_code <- as.numeric(riverbeds$grid_code) # set field to numeric in preparation for next step
+riverbeds <- spTransform(riverbeds, crs) # transform to Bonaire crs
+# The next step uses the empty raster we created as a basis to convert the riverbeds shape file to a raster layer. The riverbeds can all have the same value; we therefore use the field 'grid_code' to fill up the raster values, which conveniently consists only of the value '1'.
+riverbeds_raster <- rasterize(riverbeds, bonaire.raster, field = riverbeds$grid_code) 
+# Create a distance-to predictor;
+dist_riverbeds <- distance(riverbeds_raster)
+dist_riverbeds <- mask(dist_riverbeds, landuse_sdm)
+names(dist_riverbeds) <- "dist_riverbeds"
+plot(dist_riverbeds) # check
+unlink("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/temp/*", recursive = T, force = T) # clean temp
+
+###############################Urban areas##############################
+
+# Urban areas (reclassified from land use layer);
+urban <- raster("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/LCCbonaire37/urban.img")
+# Resample to 10x10m, using the land use layer and nearest neighbor;
+urban_sdm <- resample(urban, landuse_sdm, method = "ngb")
+urban_sdm <- mask(urban_sdm, landuse_sdm)
+names(urban_sdm) <- "urban_sdm"
+dist_urban <- urban_sdm # copy to create distance-to layer
+# Convert all non-urban areas, which right now have the value '0', to 'NA' to permit generating a distance-to variable.
+dist_urban[dist_urban == 0] <- NA
+dist_urban <- distance(dist_urban)
+dist_urban <- mask(dist_urban, landuse_sdm)
+names(dist_urban) <- "dist_urban"
+plot(dist_urban)
+
+###############################Urban green##############################
+
+# Urban green (reclassified from land use layer);
+urban_green <- raster("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/LCCbonaire37/urban_green.img")
+urban_green_sdm <- resample(urban_green, landuse_sdm, method = "ngb")
+urban_green_sdm <- mask(urban_green_sdm, landuse_sdm)
+names(urban_green_sdm) <- "urban_green_sdm"
+dist_urban_green_sdm <- urban_green_sdm
+dist_urban_green_sdm[dist_urban_green_sdm == 0] <- NA
+dist_urban_green_sdm <- distance(dist_urban_green_sdm)
+dist_urban_green_sdm <- mask(dist_urban_green_sdm, landuse_sdm)
+names(dist_urban_green_sdm) <- "dist_urban_green_sdm"
+
+##############################'Land nature'#############################
+
+# Land nature (reclassified from land use layer) contains all nature classes except beach and other ocean-related classes.
+landnature <- raster("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/LCCbonaire37/landnature.img")
+landnature_sdm <- resample(landnature, landuse_sdm, method = "ngb")
+landnature_sdm <- mask(landnature_sdm, landuse_sdm)
+names(landnature_sdm) <- "landnature_sdm"
+dist_landnature_sdm <- landnature_sdm
+dist_landnature_sdm[dist_landnature_sdm == 0] <- NA
+dist_landnature_sdm <- distance(dist_landnature_sdm)
+dist_landnature_sdm <- mask(dist_landnature_sdm, landuse_sdm)
+names(dist_landnature_sdm) <- "dist_landnature_sdm"
+
+###############################'Sea nature'#############################
+
+# Sea nature (reclassified from land use layer) contains all sea-related nature classes including 'beach'
+seanature <- raster("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/LCCbonaire37/seanature.img")
+seanature_sdm <- resample(seanature, landuse_sdm, method = "ngb")
+seanature_sdm <- mask(seanature_sdm, landuse_sdm)
+names(seanature_sdm) <- "seanature_sdm"
+dist_seanature_sdm <- seanature_sdm
+dist_seanature_sdm[dist_seanature_sdm == 0] <- NA
+dist_seanature_sdm <- distance(dist_seanature_sdm)
+dist_seanature_sdm <- mask(dist_seanature_sdm, landuse_sdm)
+names(dist_seanature_sdm) <- "dist_seanature_sdm"
+
+#######################Digital Elevation Model (DEM)####################
+
+# DEM from https://www.dcbd.nl/document/digital-elevation-model-bonaire
+dem <- raster("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/bonaire_dem.asc")
+dem <- dem + 0
+# spTransform doesn't work on rasters, so let's use raster::projectRaster
+dem <- projectRaster(dem, 
+                     landuse_sdm, 
+                     res = 10, # cell resolution
+                     crs = crs, # coordinate system
+                     method = 'bilinear') # method; bilinear best for continuous data
+dem_sdm <- resample(dem, landuse_sdm, method = "ngb")
+dem_sdm <- mask(dem_sdm, landuse_sdm)
+names(dem_sdm) <- "dem_sdm"
+plot(dem_sdm)
+
+#################################Soil map###############################
+
+# Soil map from https://www.dcbd.nl/document/soil-map-bonaire. I chose the field 'Hoofdtype'.
+soilmap <- readOGR(dsn = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/bonbod.shp")
+soilmap <- spTransform(soilmap, crs)
+soilmap$Hoofdtype <- as.factor(soilmap$Hoofdtype) # set for conversion
+soilmap_sdm <- rasterize(soilmap, bonaire.raster, field = soilmap$Hoofdtype)
+soilmap_sdm <- mask(soilmap_sdm, landuse_sdm)
+names(soilmap_sdm) <- "soilmap_sdm"
+plot(soilmap_sdm)
+#################################Geology map###############################
+
+geologymap <- readOGR(dsn = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/Bonaire_Geologie.shp")
+geologymap <- spTransform(geologymap, crs)
+geologymap$Geologie <- as.factor(geologymap$Geologie)
+geologymap_sdm <- rasterize(geologymap, bonaire.raster, field=geologymap$Geologie)
+geologymap_sdm <- mask(geologymap_sdm, landuse_sdm)
+names(geologymap_sdm) <- "geologymap_sdm"
+plot(geologymap_sdm)
+
+#################################Footpath map###############################
+
+footpathmap <- readOGR(dsn= "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/BON_veg_footpath.shp")
+footpathmap$ID <- as.numeric(footpathmap$ID)
+footpathmap <- spTransform(footpathmap, crs)
+footpathmap_raster <- rasterize(footpathmap, bonaire.raster, field = footpathmap$ID) 
+plot(footpathmap_raster)
+
+#Distance to footpath# 
+dist_footpaths <- distance(footpathmap_raster)
+dist_footpaths <- mask(dist_footpaths, landuse_sdm)
+names(dist_footpaths) <- "dist_footpaths"
+plot(dist_footpaths) # check
+unlink("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/temp/*", recursive = T, force = T) #empty temp folder
+
+#################################Geomorphology map###############################
+
+geomorphmap <- readOGR(dsn="C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/Geomrelief.shp")
+geomorphmap$Hoofdtype <-as.factor(geomorphmap$Hoofdtype)
+geomorphmap <- spTransform(geomorphmap, crs)
+geomorphmap_sdm <- rasterize(geomorphmap, bonaire.raster, field = geomorphmap$Hoofdtype)
+geomorphmap_sdm <- mask(geomorphmap_sdm, landuse_sdm)
+names(geomorphmap_sdm) <- "geomorphmap_sdm"
+plot(geomorphmap_sdm)
+
+#################################Important Biodiversity Areas map###############################
+
+ibamap <- readOGR(dsn="C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/BON_IBA_IMARES.shp")
+ibamap$Nr <- as.factor(ibamap$Nr)
+ibamap <- spTransform(ibamap, crs)
+ibamap_sdm <- rasterize(ibamap, bonaire.raster, field = ibamap$Nr)
+ibamap_sdm <- mask(ibamap_sdm, landuse_sdm)
+names(ibamap_sdm) <- "ibamap_sdm"
+plot(ibamap_sdm)
+
+# Distance from Important Biodiversity Area #
+
+dist_iba <- ibamap_sdm
+dist_iba[dist_iba == 0] <- NA
+dist_iba <- distance(dist_iba)
+dist_iba <- mask(dist_iba, landuse_sdm)
+names(dist_iba) <- "dist_iba"
+plot(dist_iba) # check
+
+#################################Vegitation map###############################
+
+vegmap <- readOGR(dsn="C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/GIS/vegetation_2_19n.shp")
+vegmap$LANDSCAPE_ <- as.factor(vegmap$LANDSCAPE_)
+vegmap <- spTransform (vegmap, crs)
+vegmap_sdm <- rasterize(vegmap, bonaire.raster, field = vegmap$LANDSCAPE_)
+vegmap_sdm <- mask(vegmap_sdm, landuse_sdm)
+names(vegmap_sdm) <- "vegmap_sdm"
+plot(vegmap_sdm)
+
+vegmap$ID <- as.numeric(vegmap$ID)
+vegmap_raster <- rasterize(vegmap, bonaire.raster, field=vegmap$ID)
+dist_veg <- distance(vegmap_raster)
+dist_veg <- mask(dist_veg, landuse_sdm)
+names(dist_veg) <- "dist_veg"
+plot(dist_veg) # check
+
+
+##########################Exporting everything##########################
+
+
+
+# Stack all layers; this is also a good way to check if all layers have exactly the same amount of columns, rows, ...
+stack <- stack(landuse_sdm, 
+               dist_riverbeds, 
+               urban_sdm, 
+               dist_urban, 
+               urban_green_sdm, 
+               dist_urban_green_sdm,
+               landnature_sdm,
+               dist_landnature_sdm,
+               seanature_sdm,
+               dist_seanature_sdm,
+               dem_sdm,
+               soilmap_sdm,
+               geologymap_sdm,
+               geomorphmap_sdm, 
+               dist_footpaths,
+               dist_iba)
+
+# Write all the rasters from the stack to separate .img (HFA) files;
+dir.create("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/environment")
+writeRaster(stack,
+            filename = file.path("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/environment", names = names(stack)),
+            bylayer = TRUE,
+            overwrite = TRUE,
+            format = "HFA")

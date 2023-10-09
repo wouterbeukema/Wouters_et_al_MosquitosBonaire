@@ -1,0 +1,389 @@
+#######################################################################
+#########################ENMeval model building########################
+#######################################################################
+
+# Wouter Beukema [wouter.beukema@naturalis.nl], 10/2022
+
+#######################################################################
+
+# Necessary packages;
+library(rJava) # for use of maxent.jar algorithm
+# When running the loop below, there is a chance that Java will run out of available memory because the built-in Garbage Collection (GC) process repeatedly fails to clean it. This can be solved by allocating additional memory before loading rJava or any other packages, and/or using a different garbage collector;
+options(java.parameters = c("-XX:+UseConcMarkSweepGC", "-Xmx8192m"))
+library(raster) # to work with spatial files
+library(dplyr) # for data processing
+library(dismo) # supporting functions for species distribution modelling
+library(ecospat) # supporting functions for calc. validation metrics
+library(ENMeval) # for species distribution modelling
+library(ENMTools) # to compute Pearsons correlation coefficients
+
+#######################################################################
+##############################Introduction#############################
+#######################################################################
+
+# The current version of the ENMeval package (2.0.0) can only model species separately; lists of species aren't accepted. I therefore wrote loops to run SDMs.
+# Misc. note; I initially used the maxnet algorithm, but this does not provide information on variable importance. I therefore switched to using maxent.jar. Maxnet also regularly produces cloglog predictions that instead of ranging between 0-1 generally show a small range in between these two numbers. Finally, maxnet usually didn't work when including 'hinge features'; this is a known bug that persists to at least version 2.0.0 (https://githubmemory.com/repo/jamiemkass/ENMeval/issues/92). 
+
+# This script consists of four parts. The separate steps can be summarized as follows;
+
+# Part 0
+# Reading input data
+
+# Part 1
+# (1) Generating environment for saving results
+
+# Part 2
+# (2.1) Running initial SDMs using all predictors
+# (2.2) Model selection based on crossvalidation results
+# (2.3) Assessing if the model performs better than random
+# (2.4) Selecting the main predictors that contribute to the model
+# (2.5) Step-wise removal of highly correlated variables
+# (2.6) Cleaning part of the global environment to save space
+
+# Part 3
+# (3.1) Running final models
+# (3.2) Determine thresholds to convert predictions to binary
+# (3.3) Cleaning part of the global environment to save space
+
+#######################################################################
+###############################Part 0##################################
+#######################################################################
+
+# Read species data (change to your path);
+species <- na.exclude(read.delim("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/MosquitoBon_cleaned.txt", h = T, sep = "\t", row.names = NULL))
+species <- species[-c(1,5)] # only keep species, X, Y - CHECK BEFORE RUNNING
+species$Species <- as.factor(species$Species)
+colnames(species)[which(names(species) == "decimalLongitude")] <- "X"
+colnames(species)[which(names(species) == "decimalLatitude")] <- "Y"
+
+# Read background data;
+bg <- na.exclude(read.delim("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/bgm.txt", h = T, sep = "\t", row.names = NULL))   
+bg <- bg[,-1] # remove row.names
+colnames(bg)[which(names(bg) == "decimalLongitude")] <- "X"
+colnames(bg)[which(names(bg) == "decimalLatitude")] <- "Y"
+
+# Read environmental data. The dollar sign in '\\.img$' makes sure that the .img spatial reference files (such as 'img.aux') are ignored.
+# After a recent update, raster::stack doesn't preserve files names anymore. Therefore, I added a few steps to add these to the stack, making SDM results easier interpretable;
+list <- list.files(path = "C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/environment", pattern ='\\.img$', full.names = T)
+environment <- stack(list)
+list <- gsub('C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/environment/','', list)
+list <- gsub('.img','', list)
+names(environment) <- list
+
+# Make sure to set the categorical variables to factors;
+environment$landuse_sdm <- as.factor(environment$landuse_sdm)
+environment$urban_sdm <- as.factor(environment$urban_sdm)
+environment$urban_green_sdm <- as.factor(environment$urban_green_sdm)
+environment$landnature_sdm <- as.factor(environment$landnature_sdm)
+environment$seanature_sdm <- as.factor(environment$seanature_sdm)
+environment$dem_sdm <- as.factor(environment$dem_sdm)
+environment$geologymap_sdm <- as.factor(environment$geologymap_sdm)
+environment$geomorphmap_sdm <- as.factor(environment$geomorphmap_sdm)
+environment$ibamap_sdm <- as.factor(environment$ibamap_sdm)
+environment$soilmap_sdm <- as.factor(environment$soilmap_sdm)
+environment$vegmap_sdm <- as.factor(environment$vegmap_sdm)
+
+#######################################################################
+###############################Part 1##################################
+#######################################################################
+
+#############(1) Generating environment for saving results#############
+
+#i="Haemagogus chrysochlorus"
+
+#######################################################################
+###############################Part 2##################################
+#######################################################################
+
+###########(2.1) Running initial SDMs using all predictors#############
+
+# Modelling loop to run initial models for a group of species.
+# Check first if for each species if there are at least 10 occurrences available to fit a model. The choice for this number is arbitrary; change if desired;
+#for (i in levels(species$Species)){ # for every level in species
+i=levels(species$Species)[8]
+  subset <- subset(species, species == i) # create subset
+  if(nrow(subset) < 4) { # if less than 4 records
+    skipped <- data.frame("Skipped because there are less than 4 occurrence records available for this species")
+    write.table(skipped, file.path(path, paste0(i, "_skipped.txt")), row.names = FALSE, col.names = FALSE)
+  } else {
+    subset <- subset[,-1] # Drop species name
+    
+    # Select number of spatial blocks based on number of occurrences (=user-defined approach, see explanation and other options at http://cran.nexr.com/web/packages/ENMeval/vignettes/ENMeval-vignette.html#eval). The below-used rules for the amount of blocks chosen are based on arbitrary choice of amounts of occurrences; CHANGE PER CASE/PROJECT;
+    if(nrow(subset) < 10){ # if less than 20 records
+      ngrps <- 2 # two blocks
+    } else {
+      if(nrow(subset) < 15){ # if less than 50 records
+        ngrps <- 3 # three blocks
+      } else {ngrps <- 5} # else 5 blocks
+    }
+    # K-means sampling; partition the points into blocks such that the sum   of squares from points to the assigned cluster centres is minimized;
+    kmeans <- kmeans(subset, ngrps) 
+    occs.grp <- kmeans$cluster # attribute groups
+    # Check and save picture;
+    pdf(file = file.path("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/results_test", paste0(i, "_blocks.pdf")))
+    plot(environment[[1]], col = 'gray', legend = FALSE) # BON background
+    points(subset, pch = 21, bg = occs.grp) # points
+    dev.off()
+    
+    centers <- kmeans$center # extract centroid of grid cells
+    # Determine distances between background points and centroids;
+    d <- pointDistance(bg, centers, lonlat = FALSE)
+    d[is.na(d)] = 0 # convert NA to 0
+    # Set minimum distances between blocks and background points;
+    bg.grp <- apply(d, 1, function(x)
+      which(x == min(x)))
+    # Combine lists to blocking object;
+    user.grp <- list(occs.grp = occs.grp, 
+                     bg.grp = bg.grp)
+    
+    # Define temp folder (this would NOT be the C drive on a Naturalis remote instance, but for instance D. The C drives of our instances run out of memory quickly);
+    rasterOptions(tmpdir = file.path("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/temp"))
+    
+    # For an elaborate explanation about the function below, see https://jamiemkass.github.io/ENMeval/articles/ENMeval-2.0.0-vignette.html#running-enmeval.
+    # Feature classes (fc) used to build response curves may be linear (L), quadratic (Q), product (P), threshold (T), hinge (H), or a combination of these. See e.g. Merow et al. (2013, https://doi.org/10.1111/j.1600-0587.2013.07872.x) on why I decided not to include product features here.
+    # The full range of available regularization multiplier values (1-5) is used.
+    initial_model <- ENMevaluate(occs = subset, 
+                                 envs = environment,
+                                 bg = bg, 
+                                 taxon.name = i,
+                                 algorithm = 'maxent.jar', 
+                                 partitions = 'user',
+                                 user.grp = user.grp,
+                                 tune.args = list(fc = c("L", 
+                                                         "LQ",
+                                                         "H",
+                                                         "LQH"), 
+                                                  rm = 1:5))
+     # Save the initial model as a .rdata file in the results folder. This file will also contain the validation metrics, contributions of all variables, etc. I'm skipping this at the moment (for the initial model, not for the final model) because it may generate very large (unnecessary) files on the disk;
+    # save(initial_model, file = file.path(path, paste0(i, "_initial_model.rdata")))
+    
+    #######(2.2) Model selection based on cross-validation results#######
+    
+    # Grab the validation statistics;
+    validation_stats <- eval.results(initial_model)
+    # Given the conclusions presented by Velasco & Gonzalez-Salazar (2019, https://doi.org/10.1016/j.ecoinf.2019.02.005) and Low et al. (2021, https://doi.org/10.1111/ddi.13211) I did not use AICc to identify the 'optimal' model. Instead, I used a method that uses cross-validation results by selecting models with the lowest average test omission rate, and to break ties, with the highest average validation AUC. Use of the AUC has been criticized in the past, but is fine when comparing models constructed with the same data. See also https://jamiemkass.github.io/ENMeval/articles/ENMeval-2.0.0-vignette.html#eval.
+    # This dplyr operation executes the selection criteria explained above;
+    opt.seq <- validation_stats %>% 
+      filter(or.10p.avg == min(or.10p.avg)) %>% 
+      filter(auc.val.avg == max(auc.val.avg))
+    # Combine the two data frames, and add a column to easily identify the   optimal model (beware, duplicates the row with the best model and places it as first row of the data frame);
+    modelselection <- bind_rows(list(optimal = opt.seq, 
+                                     orginal_model = validation_stats), 
+                                .id = 'optimal')
+    # Save optimal FC and RM settings for use in null model comparison;
+    fc_opt <- as.character(modelselection$fc[1])
+    rm_opt <- as.numeric(modelselection$rm[1])
+    
+    #######(2.3) Assessing if the model performs better than random######
+    
+    # Generate a series of null models to assess whether the empirical model performs better than random or not. The approach used here is based on that of Raes & ter Steege (2007, https://doi.org/10.1111/j.2007.0906-7590.05041.x), but evaluates models on the same withheld occurrence data as the empirical model (Bohl et al. 2019, https://doi.org/10.1111/jbi.13573. This allows for direct comparisons between null performance metrics (test AUC, in this case) and those of the empirical models.
+    mod.null <- ENMnulls(initial_model, 
+                         no.iter = 100,
+                         user.eval.type = "kspatial",
+                         mod.settings = list(fc = fc_opt, 
+                                             rm = rm_opt))
+    # Save the null models as a .rdata file in the results folder;
+    save(mod.null, file = file.path(path, paste0(i, "_nullmodels.rdata")))
+    # Grab the validation metrics;
+    null_results <- null.emp.results(mod.null)
+    # Save violin plot of null distribution vs. empirical value;
+    pdf(file = file.path("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/results_test", paste0(i, "_nullmodels.pdf")))
+    p <- evalplot.nulls(mod.null, stats = c("auc.val"), plot.type = "violin")
+    print(p)
+    dev.off()
+    # Grab the test AUC (see Bohl et al. 2019 and short explanation above);
+    AUC.test <- null_results[null_results$statistic == "emp.mean", "auc.val"]
+    # Grab the 95% C.I. upper limit null model test AUC value;
+    AUC.nulls <- quantile(null.results(mod.null)$auc.val.avg, probs=.95)
+    # I use a 'next' statement to skip the rest of the code and start with the next species in case the empirical test AUC isn't higher than the 95% C.I. upper limit average test AUC of the null models (i.e., model doesn't perform significantly better than random);
+    if (AUC.test < AUC.nulls){
+      next
+    } else {
+      
+      ##(2.4) Selecting the main predictors that contribute to the model###
+      
+      # Although a machine-learning algorithm like Maxent can deal with large numbers of (highly-correlated) predictors (Feng et al. 2019, https://doi.org/10.1002/ece3.5555), risk for overparameterization remains when the species in question is represented by few occurrence records. Also, models which are built using predictors that reflect physiology or ecology of species predict and project (transfer) more accurately compared to models that are based on "standard" sets of environmental predictors, such as Bioclim (Roedder et al. 2009, https://doi.org/10.1371/journal.pone.0007843; Zeng et al. 2016,https://doi.org/10.1016/j.ecolmodel.2016.09.019; Petitpierre et al. 2017, https://doi.org/10.1111/geb.12530). Finally, although Maxent doesn't suffer from those correlations when describing relationships between occurrence and variables or when predicting a distribution, projections to other areas or time periods can become unreliable if highly correlated variable pairs remain (Feng et al. 2019, https://doi.org/10.1002/ece3.5555). Therefore, below I first decrease the amount of variables by removing those that contribute less than 1% to the model, after which I calculate Pearson's correlation coefficients to determine pairs of highly correlated variables. The latter are then removed in a step-wise manner based on their % contribution to the model.
+      
+      # Grab variable importance;
+      var_importance <- initial_model@variable.importance[[opt.seq$tune.args]]
+      # Sort in descending order based on column 'percent.contribution', and retain only the predictors that contribute for more than 1%. The choice for 1% is arbitrary. Maxent often ascribes percentages of <1% to the least-contributing variables in your dataset, which this threshold filters out;
+      var_importance_selection <- var_importance %>% filter(percent.contribution > 1)
+      # Subset original variable raster stack using the selected predictors; 
+      env_selected <- subset(environment, var_importance_selection$variable)
+      # Grab list of selected predictors;
+      var.list <- names(env_selected)
+      
+      #######(2.5) Step-wise removal of highly correlated variables########
+      
+      # Assess if there are highly correlating variables among the remaining predictors using Pearson's correlation coefficient (r). A pair of variables is here considered to be highly correlated if it has an r of >0.7. Ideally, you would use expert (ecological) knowledge each time when this occurs, choosing the variable you want to keep (and the one to drop). However, this would mean that a predictor dataset has to be manually edited each time before a new model can start. Also, ecological knowledge about a species might be lacking, or you might be running models for such a large amount of species that the process has to be automated. The steps taken below are inspired by those taken when using the'MaxentVariableSelection' R package (https://cran.r-project.org/web/packages/MaxentVariableSelection/vignettes/MaxentVariableSelection.pdf).
+      
+      # Calculate Pearson correlation coefficients;
+      corr <- raster.cor.plot(env_selected, method = "pearson")
+      # Grab the coefficients;
+      corr_summary <- corr$cor.heatmap$data
+      corr_summary$Var1 <- as.character(corr_summary$Var1)
+      corr_summary$Var2 <- as.character(corr_summary$Var2)
+      # Round values to two digits (I added this step because when not rounded, sometimes values of 1 are selected when subsetting);
+      corr_summary$value <- round(corr_summary$value, digits = 2)
+      # Subset those that have a Pearsons r>0.7, but lower than 1 (so to avoid selecting all combinations of the same variable as well);
+      corr_subset <- subset(corr_summary, value > 0.7 & value < 1)
+      # Remove duplicated pairwise results;
+      corr_subset <- corr_subset[!duplicated(t(apply(corr_subset, 
+                                                     1, 
+                                                     sort))),]
+      
+      # If there are highly correlated variable pairs, remove step-wise; 
+      if (length(as.matrix(corr_subset)) > 0) { # if corr_subset has obs
+        for(j in 1:nrow(corr_subset))  # for each row in corr_subset
+          var1 <- corr_subset[j,1] # grab variable name from the 1st column
+        var2 <- corr_subset[j,2] # Grab variable name from the 2nd column
+        # grab % contribution of var1;
+        var1_perc <- var_importance_selection[is.element(var_importance_selection$variable, var1), 2]
+        # grab % contribution of variable 2;
+        var2_perc <- var_importance_selection[is.element(var_importance_selection$variable, var2), 2]
+        # if var1_perc > var2_perc, remove var2 from env_selected;
+        if (var1_perc > var2_perc){
+          env_selected <- dropLayer(env_selected, var2)
+          # if not, remove var1;  
+        } else {env_selected <- dropLayer(env_selected, var1)
+        }
+        env_final <- env_selected # create final raster stack
+      } else {env_final <- env_selected # in case of empty corr_subset
+      }  
+      
+      ####(2.6) Cleaning part of the global environment to save memory####   
+      
+      # As maxent.jar is being used, there is a risk that java will cause R to run out of memory while running the loop. While it is possible to increase the default memory that R is allowed to use, I prefer to clean the global environment during the modelling process.
+      rm(initial_model, mod.null, corr)
+      
+      #####################################################################
+      ###############################Part 3################################
+      ##################################################################### 
+      
+      ####################(3.1) Running final models#######################
+      
+      # The optimal model settings identified are not necessarily optimal for the final model as well, as this is built with the more restricted set of environmental predictors. Therefore, perform model selection again as well;
+      final_model <- ENMevaluate(occs = subset, 
+                                 envs = env_final,
+                                 bg = bg, 
+                                 taxon.name = i,
+                                 algorithm = 'maxent.jar', 
+                                 partitions = 'user',
+                                 user.grp = user.grp,
+                                 tune.args = list(fc = c("L", 
+                                                         "LQ",
+                                                         "H",
+                                                         "LQH"), 
+                                                  rm = 1:5))
+      # Change the name of the ENMevaluation object 'final_model'. If you don't do this, the object will also be called 'final_model' when you would load() it into R at a later point, even when the rdata file name does include the species name. This might be undesirable, for instance if you want to compare stats of several final_models (that would overwrite each other when loading into R, due to having the same name). Therefore, assign species name to object;
+      assign(paste0(i, "_final_model"), final_model)
+      # Save model (somewhat complex workaround to not have to explicitly use the object's name). This file will also contain the validation metrics, contributions of all variables, etc;
+      save(list = paste0(i, "_final_model"),
+           file = file.path(path, paste0(i, "_final_model.rdata")))
+      # Identify 'best' model (still with original final_model object to keep things simple);
+      validation_stats <- eval.results(final_model)
+      opt.seq <- validation_stats %>% 
+        filter(or.10p.avg == min(or.10p.avg)) %>% 
+        filter(auc.val.avg == max(auc.val.avg))
+      # Grab model selection results and save;
+      modelselection <- bind_rows(list(optimal = opt.seq, 
+                                       orginal_model = validation_stats), 
+                                  .id = 'optimal')
+      write.csv(modelselection, file.path(path, paste0(i, "_modelselection.csv")), row.names = FALSE)
+      
+      # Getting response curve data; first, grab name 'best' model;
+      j = as.character(droplevels(opt.seq$tune.args[1])) 
+      # Grab model;
+      best <- final_model@models[[j]]
+      # Grab variable importance of best model. I couldn't immediately find this info in the 'best' Formal class MaxEnt object, so I'm grabbing it from the original ENMevaluation object that contains all the final model results;
+      var.imp <- final_model@variable.importance[[j]]
+      write.csv(var.imp, file.path(path, paste0(i, "_var_imp.csv")), row.names = FALSE)
+      # Make into factor for loop;
+      var.imp$variable <- as.factor(var.imp$variable)
+      # Create empty data frame (as matrix with nr of rows defined to allow cbind function below);
+      plotdata <- data.frame(matrix(nrow = 100))
+      # Remove unnecessary first row;
+      plotdata <- plotdata[,c(-1)]
+      # This loop writes plot data for all variables in the final best model to a single data frame. The 'predval' column comprises the average prediction for all data points that were used to fit the model (see dismo::response information);
+      for(v in levels(var.imp$variable)){
+        r <- as.data.frame(response(best, var = v))
+        colnames(r)[which(names(r) == "V1")] <- v
+        colnames(r)[which(names(r) == "p")] <- paste0(v, "_predval")
+        plotdata <- cbind(plotdata, r)
+      }
+      write.csv(plotdata, file.path(path, paste0(i, "_plotdata.csv")), row.names = FALSE)
+      graphics.off()
+      # Also create a picture of all graphs;
+      pdf(file = file.path("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/results_test", paste0(i, "_plots.pdf")))
+      response(best)
+      dev.off()
+      
+      # Export suitability map; first, grab predictions (rasterstack of all different setting combinations);
+      pred.seq <- eval.predictions(final_model)
+      pred.seq <- subset(pred.seq, j) # grab 'best' based on name
+      # Save to folder that contains the other results;
+      writeRaster(pred.seq, 
+                  file.path("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/results_test", paste0(i, '_current.img')), 
+                  overwrite = TRUE)
+      plot(pred.seq)
+      
+      #####(3.2) Determine thresholds to convert predictions to binary#####
+      
+      # See Guillera-Arroita et al. (2015, https://doi.org/10.1111/geb.12268) for full explanation; using thresholds always leads to loss of data, and binary maps generally do not reflect the species distribution well. Various thresholds have nevertheless been proposed. In ENMeval, only one is calculated - the 10-percentile threshold. I here use the dismo package to obtain others. To do so, it is necessary to first extract predicted values.
+      # Create SpatialPoints to extract predicted raster values;
+      subset_spdf <- SpatialPoints((coords = (subset[, c("midlong", "midlat")])))
+      # Same for background points;
+      bg_spdf <- SpatialPoints((coords = (bg[, c("midlong", "midlat")])))
+      # Obtain predicted values ('c()' is added so a vector is made instead of a matrix, which isn't accepted by dismo::evaluate);
+      est.occs <- c(raster::extract(pred.seq, subset_spdf))
+      # Obtain background predicted values;
+      est.bg <- c(raster::extract(pred.seq, bg_spdf))
+      # Evaluate predictive ability of model;
+      ev <- dismo::evaluate(est.occs, est.bg)
+      # Thresholds;
+      thresholds <- dismo::threshold(ev)
+      # Save information as a .csv file;
+      write.csv(thresholds, 
+                file.path(path, paste0(i, "_thresholds.csv")), 
+                row.names = FALSE)  
+      # Generate matrix for reclassification, using the spec_sens threshold(first row, second column of 'thresholds' dataframe). Check background info for the 'reclassify' function for details;
+      m <- matrix(c(0,thresholds[1,2],0, 
+                    thresholds[1,2],1,1), 
+                  ncol = 3, 
+                  byrow = TRUE)
+      # Reclassify the prediction;
+      binary <- reclassify(pred.seq, m)
+      # Save to folder that contains the other results;
+      writeRaster(binary, 
+                  file.path(path, paste0(i, '_currentbinary_specsens.img')), 
+                  overwrite = TRUE)
+      
+      # Instead of using a 'standard' threshold, it is also possible to make a series of binary maps, each based on a different threshold, and to let experts choose the 'best' map. The code (loop) below generates maps for four thresholds; 0.2, 0.4, 0.6, 0.8.
+      # First make a data frame with thresholds for loop;
+      thresholds_arb <- as.data.frame(c(0.2, 0.4, 0.6, 0.8))
+      names(thresholds_arb) <- c('thresholds')
+      thresholds_arb$thresholds <- as.factor(thresholds_arb$thresholds)
+      # Loop;
+      for(t in levels(thresholds_arb$thresholds)){
+        m <- matrix(as.numeric(c(0,t,0, 
+                                 t,1,1), 
+                               ncol = 3, 
+                               byrow = TRUE))
+        binary <- reclassify(pred.seq, m)
+        writeRaster(binary, 
+                    file.path(path, 
+                              paste0(i, '_currentbinary_', t, '.img')), 
+                    overwrite = TRUE)
+      }
+      
+      ################(3.3) Cleaning global environment###################
+      
+      # As maxent.jar is being used, there is a risk that java will cause R to run out of memory while running the loop. While it is possible to increase the default memory that R is allowed to use, I prefer to clean the global environment during the modelling process.
+      rm(bg_spdf, binary, coords, env_final, ev, modelselection, null_results, opt.seq, pred.seq, subset, subset_spdf, final_model, thresholds, validation_stats, var_importance, var_importance_selection, AUC.test, est.bg, est.occs)
+      
+      # Clean the temp folder contents;
+      unlink("C:/Users/roelm/OneDrive/Documenten/ABC expeditie muggen/Modelling/Bonaire/R/temp/*", recursive = T, force = T)
+      
+    } # parts 2.4 - 3.3
+  } # parts 2.1 (when more than 10 occurrences are available) - 3.3
+} # entire loop
